@@ -1,0 +1,280 @@
+---
+title: "Spatial Biology of Cancer Drylab Submission"
+author: "Arthur Theuer & Lucas Merlicek"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+### Libraries:
+
+```{r, warning=FALSE}
+library(Seurat)
+library(SeuratDisk)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+```
+
+## SINGLE CELL DATA
+
+### Load H5 Seurat file:
+
+```{r, message=FALSE}
+scf <- LoadH5Seurat("r_preprocessed/scf.h5Seurat")
+```
+
+### Load all markers:
+
+```{r}
+load("r_preprocessed/all_markers.sc.RData")
+```
+
+### Filter for specific markers:
+
+```{r}
+# Filter the rows containing certain markers
+filtered_rows <- all.markers %>%
+  dplyr::filter(gene == "CD8" | gene == "CD4")
+
+# Print the filtered rows
+print(filtered_rows)
+```
+
+### Import 10x Genomics panel:
+
+```{r, warning=FALSE}
+panel <- read.csv("input_data/10x_human_breast_cancer_gene_panel.csv", header = F)[,c(1,5)] %>% setNames(., c("gene", "annotation"))
+
+# Then let's subset the panel for the genes in the dataset, and use that to define an approximate score for each cell type:
+panel <- panel %>% filter(gene %in% rownames(scf))
+
+# extract the list of cell types in the annotation column
+panel_cell_types <- panel$annotation %>% unique
+
+# Repeat the same for the all the annotated cell types in the panel, in an automated way.
+# As AddModuleScore accepts a list of vectors to score multiple expression programs at once, where 'each entry should be a vector of feature names' (i.e. of gene names),
+# reshape the panel dataframe as a named list of vectors, one vector for each cell type annotation:
+annotation_list <- panel %>% select(gene, annotation) %>% group_by(annotation) %>% # this groups each gene to the cell type annotation
+                            group_map(~.$gene) %>% # this creates the list of vectors, where each vector is the set of genes for a cell type
+                            setNames(., panel %>% group_keys(annotation) %>% pull(1)) # this names each vector in the list with the matching cell type label
+
+
+# substitute the spaces with underscores in the cell type labels
+names(annotation_list) <- names(annotation_list) %>% stringr::str_replace_all(pattern = " ", replacement = "_")
+
+# To be on the safe side, make a temporary copy of the Seurat object and operate on that:
+tmp = scf
+
+tmp <- AddModuleScore(tmp, 
+                      features = annotation_list, 
+                        name = paste0(names(annotation_list) , "_score")) # add 'score_' at the beginning of the name of the score
+
+# for aesthetics, we can remove the trailing number Seurat adds to the score label:
+names(tmp@meta.data) <- names(tmp@meta.data) %>% stringr::str_replace(pattern = "_score.*", "_score")
+```
+
+### Plot panel scores:
+
+```{r feature_plots, fig.width=15, fig.height=15}
+# Plot all scores obtained:
+#FeaturePlot(tmp, features = names(tmp@meta.data) %>% grep(., pattern= "_score", value=T), # select names of the scores from the metadata and pass them as features
+#                  order=T) # plot cells with highest values on top
+
+# To make the plotting quicker at lower resolution, use the function 'raster=T'
+#FeaturePlot(tmp, features = names(tmp@meta.data) %>% grep(., pattern= "_score", value=T),
+#                 order=T, raster= T, ncol=2)
+
+# We can also plot them along with the initial clustering:
+# Note, make sure you have the 'patchwork' library loaded to use '+' to put plots together:
+FeaturePlot(tmp, features = names(tmp@meta.data) %>% grep(., pattern= "_score", value=T)) +
+  DimPlot(scf, group.by = "seurat_clusters", label=T)
+
+```
+
+### Find top 5 markers for clusters for which panel markers did not suffice:
+
+```{r}
+clusters_of_interest <- c(1, 2, 5, 6, 8, 10, 13, 14, 16) # these clusters were annotated with the gene atlas
+
+for (cluster_num in clusters_of_interest) {
+  top_genes <- all.markers %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::slice_max(n = 5, order_by = avg_log2FC) %>%
+    dplyr::filter(cluster == cluster_num) %>%
+    .$gene
+
+  cat("cluster", cluster_num, ":", paste(top_genes, collapse = ", "), "\n")}
+```
+
+### Cluster annotation:
+
+```{r curated_cell_annotation, eval = FALSE, fig.height=5, fig.width=10}
+
+tmp <- scf@meta.data %>% select(orig.ident, RNA_snn_res.0.25) %>% 
+  dplyr::mutate( celltype = case_match(RNA_snn_res.0.25,
+                                              "0" ~ "T cells/NK cells",
+                                              "1" ~ "Luminal epithelial cells", # CANCER
+                                              "2" ~ "Luminal progenitor", # CANCER
+                                              "3" ~ "Fibroblasts",
+                                              "4" ~ "Macrophages",
+                                              "5" ~ "Lymphatic endothelial cells",
+                                              "6" ~ "Luminal epithelial cells/Luminal progenitors", # not cancer
+                                              "7" ~ "B cells",
+                                              "8" ~ "Adipocytes/Basal endothelial cells/Smooth muscle cells",
+                                              "9" ~ "Myoepithelial cells",
+                                              "10" ~ "B cells",
+                                              "11" ~ "Breast glandular cells",
+                                              "12" ~ "Dendritic cells",
+                                              "13" ~ "Dentritic cells -Plasma cells",
+                                              "14" ~ "Lymphatic endothelial cells",
+                                              "15" ~ "Mast cells",
+                                              "16" ~ "Ciliated cells in mammalian breast tissue"
+                                              )
+                 ) %>% select(celltype) %>% unlist
+
+names(tmp) <- colnames(scf)
+
+scf <- AddMetaData(scf, metadata = tmp, col.name = 'celltype_annotation')
+
+rm(tmp)
+
+# Visualize the clusters with the imported labels:
+DimPlot(scf, group.by = "celltype_annotation", label=F, repel=T)
+
+```
+
+#### Labelled plot missing in HTML :(
+
+## SPATIAL DATA
+
+### Load the Visium dataset:
+
+```{r}
+load(file = "r_preprocessed/vis_processed.RData")
+load(file = "r_preprocessed/all.markers.vis_res0.2.RData")
+```
+
+### QC metrics:
+
+```{r}
+# Visualize basic QC metrics
+plot1 <- VlnPlot(vis, features = "nCount_Spatial", pt.size = 0.1, group.by="orig.ident") + NoLegend() + xlab("")
+plot2 <- SpatialFeaturePlot(vis, features = "nCount_Spatial", max.cutoff = "q99") + theme(legend.position = "right")
+# using the 99th quantile cutoff to avoid having the maximum be set by few outlier spots
+plot3 <- VlnPlot(vis, features = "nFeature_Spatial", pt.size = 0.1, group.by="orig.ident") + NoLegend() + xlab("")
+plot4 <- SpatialFeaturePlot(vis, features = "nFeature_Spatial") + theme(legend.position = "right")
+wrap_plots(plot1, plot2)
+wrap_plots(plot3, plot4) 
+```
+
+### Visualize the tumor using FASN:
+
+```{r}
+p1 <- SpatialFeaturePlot(vis, features = "FASN") #, pt.size.factor = 1)
+p2 <- SpatialFeaturePlot(vis, features = "FASN", alpha = c(0.1, 1))
+p1 + p2
+```
+
+# Visualize top spacially variable features:
+
+```{r spatially_variable_genes_plot1, warning=FALSE}
+top.sv.features <- SpatiallyVariableFeatures(vis, selection.method = "moransi")[1:4]
+SpatialFeaturePlot(vis, features = top.sv.features, ncol = 4, alpha = c(0.1, 1))
+```
+
+### Visualize immune cell markers:
+
+```{r}
+SpatialFeaturePlot(vis, features = c("PTPRC", "MS4A1", "BANK1"))
+```
+
+### Clustering of spots:
+
+### Plot UMAP clustering:
+
+```{r, fig.height=5, fig.width=10}
+p1 <- DimPlot(vis, reduction = "umap", group.by = "seurat_clusters", label=T)
+p2 <- SpatialDimPlot(vis, label = TRUE, label.size = 3)
+p1 + p2
+```
+
+### Visualize the top 2 marker genes of each cluster found.
+
+```{r cluster_marker_genes, fig.height=20, fig.width=20, warning=FALSE}
+top2markers_by_cluster <- all.markers.vis.res0.2 %>% group_by(cluster) %>% 
+  dplyr::slice_max(n = 2, order_by = avg_log2FC) %>% ungroup %>% select(gene) %>% unlist
+
+SpatialFeaturePlot(object = vis, alpha = c(0.1, 1), ncol = 4, 
+                   features = top2markers_by_cluster)
+```
+
+```{r cluster_marker_genes, fig.height=20, fig.width=20, warning=FALSE}
+reg_markers <- c("MKI67", "SOX2", "PLXNB2")
+SpatialFeaturePlot(object = vis, alpha = c(0.1, 1), ncol = 3, 
+                   features = reg_markers)
+```
+
+### Characterize the tissue using the panel again:
+
+```{r, fig.height=40, fig.width=20}
+# Step 1: Extract top marker genes for each cluster
+# In this example, we select the top 5 genes for each cluster
+top_n_genes <- 5
+top_markers <- all.markers %>% group_by(cluster) %>% top_n(n = top_n_genes, wt = avg_log2FC)
+
+# Step 2: Create a new data frame with 'gene' and 'annotation' columns
+custom_panel <- top_markers %>%
+  select(gene = gene, annotation = cluster)
+
+# Step 3: Use the custom panel for mapping the clusters from the single-cell analysis
+# Check if any gene in the custom panel is not present in the dataset:
+custom_panel$gene[!custom_panel$gene %in% rownames(vis)]
+
+# Subset the custom_panel for the genes in the dataset
+custom_panel <- custom_panel %>% filter(gene %in% rownames(vis))
+
+# Extract the list of clusters
+panel_clusters <- custom_panel$annotation %>% unique
+
+# Reshape the custom_panel data frame as a named list of vectors, one vector for each cluster:
+annotation_list <- custom_panel %>% select(gene, annotation) %>% group_by(annotation) %>%
+  group_map(~.$gene) %>%
+  setNames(., panel_clusters)
+
+# Apply AddModuleScore using the custom panel, and visualize the scores using SpatialPlot
+tmp <- AddModuleScore(vis, features = annotation_list, name = paste0(panel_clusters, "_score"))
+
+SpatialPlot(tmp, ncol = 3, features = names(tmp@meta.data) %>% grep(., pattern = "_score", value = T))
+```
+
+
+#### Drawing from the various approaches that we saw and from your curated single-cell annotation, try to contextualize spatially (choose markers/scores to plot and comment if and how well they are spatially located) where are the cell types of the following:
+
+### 1 - the stroma
+cluster not clear // Adipocytes (and fibroblasts) ~ spatial cluster 2
+
+### 2 - the invasive tumor
+cluster 1 & 2 // Luminal epethelial cells and luminal progenitors ~ corresponds to spatial cluster 1
+    
+### 3 - the luminal epithelium
+cluster 6 // Luminal epithelial cells of mammary gland, correlates with immune cells ~ corresponds to spatial cluster 4
+
+### 4 - the myoepithelial layer(s)
+cluster 9 // correlated with adipocytes and basal endothelial cells ~ corresponds to spatial cluster 6
+
+### 5 - three immune cell types
+cluster 0 // NK/T cells associated with border of invasive tumor front ~ roughly corresponds to spatial cluster 0
+
+cluster 4 // Macrophages (in middle section/connective tissue) ~ no spatial cluster (maybe 5); not found in epithelial or adipose tissue
+
+cluster 7 (maybe 10) // B cells surrounding myoepithelial cells ~ no spatial cluster
+
+### 6 - any other feature/cell type you characterized and think it could be interesting to check spatially.
+cluster 3, 4, 12, 13 // fibroblasts, macrophages, dendritic cells -> connective tissue and immune cells (in the middle) -> STROMA
+
+cluster 5 // lymphatic endothelial cells ~ spatial cluster 7
+
+milk ducts often surrounded by B cells/immune cells -> see cluster 9 (myoepithelial) with cluster 7 (B cells)
