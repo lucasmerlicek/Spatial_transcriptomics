@@ -1,4 +1,4 @@
-# README for Spacial Transcriptomics analysis
+# Spacial Transcriptomics analysis
 
 This repository contains two scripts for a project focused on exploring the spatial biology of cancer using Visium data. The scripts perform the following tasks:
 
